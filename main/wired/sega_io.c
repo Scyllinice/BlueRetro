@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <esp32/rom/ets_sys.h>
+#include "sdkconfig.h"
 #include "zephyr/types.h"
 #include "tools/util.h"
 #include "adapter/adapter.h"
@@ -81,6 +82,10 @@
 
 #define TWH_TIMEOUT 4096
 #define POLL_TIMEOUT 512
+/* Cycle-counter reset budget for sega_genesis_pad_task(): the 6-button pad resets its counter
+ * when it sees no TH change for ~1.5ms (spec value), which is well above a full ~100-400us read
+ * burst (so it never resets mid-read) and well under the ~16ms inter-frame gap. Value in us. */
+#define SIX_BTN_RESET_CYCLES (CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ * 1500)
 
 #define P1_OUT0_MASK (BIT(P1_TR_PIN) | BIT(P1_TL_PIN) | BIT(P1_R_PIN) | BIT(P1_L_PIN) | BIT(P1_D_PIN) | BIT(P1_U_PIN))
 #define P1_OUT1_MASK 0
@@ -91,6 +96,16 @@
 #define SIX_BTNS_P2_C2_LO_MASK ~(BIT(P2_D_PIN) | BIT(P2_U_PIN))
 #define SIX_BTNS_P1_C3_LO_MASK (BIT(P1_D_PIN) | BIT(P1_U_PIN) | BIT(P1_L_PIN) | BIT(P1_R_PIN))
 #define SIX_BTNS_P2_C3_LO_MASK (BIT(P2_D_PIN) | BIT(P2_U_PIN) | BIT(P2_L_PIN) | BIT(P2_R_PIN))
+
+/* On the Genesis controller port the console only drives the TH select line(s); TR/TL and the
+ * data lines are ours to drive. ESP32 pins 34, 37, 38, 39 are input-only, unused here, and
+ * have no pull resistors, so they float in GPIO.in1. Restrict poll edge detection to the
+ * real console-driven select line(s) so a floating-pin glitch can't be mistaken for a TH
+ * transition and flip us to the wrong phase/output (e.g. reading a held C as Start). */
+#define GEN_TH_MASK (BIT(P1_TH_PIN - 32) | BIT(P2_TH_PIN - 32))
+/* EA 4-Way Play additionally selects the polled port with P2_TL (also GPIO.in1). P2_TR is
+ * its other select line but lives in GPIO.in, where there are no floating input-only pins. */
+#define EA_SEL_MASK1 (BIT(P1_TH_PIN - 32) | BIT(P2_TH_PIN - 32) | BIT(P2_TL_PIN - 32))
 
 #define MT_GEN_PORT_MAX 4
 #define MT_PORT_MAX 6
@@ -457,6 +472,184 @@ static void set_gen_multitap(uint8_t port, uint8_t first_port, uint8_t nb_port) 
     twh_tx(port, buffer, data - buffer, 0);
 }
 
+/* Level-driven 3-button emulation.
+ *
+ * A real 3-button pad is combinational: the console's TH line directly selects
+ * which button word appears on the data lines, continuously. The general
+ * sega_genesis_task() is edge-driven and carries phase assumptions (it advances
+ * to the "next" word on each detected TH change), which can momentarily present
+ * the wrong word if a game strobes TH in an unexpected pattern - seen on Cool
+ * Spot as a phantom Start edge that skips the menu. Mirroring the hardware with a
+ * pure level-driven loop removes those assumptions and any edge-to-switch race.
+ *
+ * Only used when BOTH ports are plain 3-button (the common case). Any 6-button,
+ * mouse, multitap or EA config - including a mixed 3-button + 6-button pair -
+ * still uses the cycle-counting sega_genesis_task(). */
+static void sega_genesis_3btn_task(void) {
+    uint32_t prev_in = GPIO.in1.val;
+
+    while (1) {
+        uint32_t in1 = GPIO.in1.val;
+        uint32_t p1_lo, p2_lo, p2_hi;
+
+        /* TH high -> B/C word (cycle 0); TH low -> A/Start word (cycle 1). */
+        if (in1 & BIT(P1_TH_PIN - 32)) {
+            p1_lo = map1[0] | map1_mask[0];
+        }
+        else {
+            p1_lo = map1[1] | map1_mask[1];
+        }
+        if (in1 & BIT(P2_TH_PIN - 32)) {
+            p2_lo = map2[0] | map2_mask[0];
+            p2_hi = map2[3] | map2_mask[3];
+        }
+        else {
+            p2_lo = map2[1] | map2_mask[1];
+            p2_hi = map2[4] | map2_mask[4];
+        }
+
+        /* Drive only the controller pins, preserve everything else. P1 lives
+         * entirely in the low bank; P2's TL is the only high-bank output. */
+        GPIO.out = (GPIO.out & ~(P1_OUT0_MASK | P2_OUT0_MASK))
+                 | (p1_lo & P1_OUT0_MASK) | (p2_lo & P2_OUT0_MASK);
+        GPIO.out1.val = (GPIO.out1.val & ~P2_OUT1_MASK) | (p2_hi & P2_OUT1_MASK);
+
+        /* Advance the turbo frame counter once per console poll (TH falling edge). */
+        if ((prev_in & BIT(P1_TH_PIN - 32)) && !(in1 & BIT(P1_TH_PIN - 32))) {
+            ++wired_adapter.data[0].frame_cnt;
+            genesis_gen_turbo_mask(0, &wired_adapter.data[0]);
+        }
+        if ((prev_in & BIT(P2_TH_PIN - 32)) && !(in1 & BIT(P2_TH_PIN - 32))) {
+            ++wired_adapter.data[1].frame_cnt;
+            genesis_gen_turbo_mask(1, &wired_adapter.data[1]);
+        }
+        prev_in = in1;
+    }
+}
+
+/* Level-driven pad emulation that handles 3-button AND 6-button per port.
+ *
+ * The 6-button pad is stateful: an internal counter walks it through 8 cycles as the console
+ * strobes TH, exposing X/Y/Z/Mode on the direction lines. The edge-driven sega_genesis_task()
+ * blocks through that sequence per poll (with core0_stall held), which for a game running in
+ * 6-button mode felt sluggish / dropped inputs. This reproduces the protocol continuously with
+ * an explicit per-port counter instead, so it's as responsive as the 3-button loop.
+ *
+ * Per the documented hardware (segaretro / jonthysell "How To Read Sega Controllers"): the pad's
+ * counter advances on every TH change and resets to 0 if no change is seen for ~1.5ms, regardless
+ * of the current TH level (the key detail - a game that idles TH low still gets a reset). We track
+ * the counter on the RISING edge only, which is an equivalent representation combined with the
+ * live TH level below - it places 0000/X/Y/Z at the same physical strobes (verified vs MK3) while
+ * sidestepping the idle-level parity offset of a literal state-0..7 count. Data by (counter c, TH):
+ *   c==3, TH high -> X/Y/Z/Mode ;  c==2, TH low -> 0000 detect signature ;
+ *   c==3, TH low  -> 1111       ;  everything else -> normal 3-button data.
+ * A 3-button port never advances its counter (always normal, so it can't be mistaken for a
+ * 6-button pad). Used only when both ports are plain 3/6-button pads; mouse/multitap/EA use
+ * sega_genesis_task(). */
+static void sega_genesis_pad_task(void) {
+    uint32_t p1_c = 0, p2_c = 0;
+    uint32_t p1_edge = xthal_get_ccount(), p2_edge = p1_edge;
+    uint32_t prev_in = GPIO.in1.val;
+
+    while (1) {
+        uint32_t now = xthal_get_ccount();
+        uint32_t in1 = GPIO.in1.val;
+        uint32_t p1_th = in1 & BIT(P1_TH_PIN - 32);
+        uint32_t p2_th = in1 & BIT(P2_TH_PIN - 32);
+        uint32_t p1_lo, p2_lo, p2_hi, p1_poll = 0, p2_poll = 0;
+
+        /* P1: 6-button counter advances on the TH rising edge (equivalent data to the spec's
+         * every-change count); a new poll burst (6-button) or frame (3-button) is flagged for a
+         * deferred turbo update below; counter resets after ~1.5ms with no TH change either way.
+         * Keep this path cheap - it's the edge->output critical path for the shared TR pin. */
+        if (p1_th != (prev_in & BIT(P1_TH_PIN - 32))) {
+            p1_edge = now;
+            if (p1_th) {
+                if (dev_type[0] == DEV_GENESIS_6BTNS) {
+                    if (p1_c == 0) {
+                        p1_poll = 1;
+                    }
+                    p1_c = (p1_c + 1) & 3;
+                }
+            }
+            else if (dev_type[0] != DEV_GENESIS_6BTNS) {
+                p1_poll = 1;
+            }
+        }
+        if (now - p1_edge > SIX_BTN_RESET_CYCLES) {
+            p1_c = 0;
+        }
+
+        if (p2_th != (prev_in & BIT(P2_TH_PIN - 32))) {
+            p2_edge = now;
+            if (p2_th) {
+                if (dev_type[1] == DEV_GENESIS_6BTNS) {
+                    if (p2_c == 0) {
+                        p2_poll = 1;
+                    }
+                    p2_c = (p2_c + 1) & 3;
+                }
+            }
+            else if (dev_type[1] != DEV_GENESIS_6BTNS) {
+                p2_poll = 1;
+            }
+        }
+        if (now - p2_edge > SIX_BTN_RESET_CYCLES) {
+            p2_c = 0;
+        }
+
+        /* P1 output (low bank only). */
+        if (p1_th) {
+            p1_lo = (p1_c == 3) ? (map1[2] | map1_mask[2]) : (map1[0] | map1_mask[0]);
+        }
+        else if (p1_c == 2) {
+            p1_lo = (map1[1] | map1_mask[1]) & SIX_BTNS_P1_C2_LO_MASK;
+        }
+        else if (p1_c == 3) {
+            p1_lo = (map1[1] | map1_mask[1]) | SIX_BTNS_P1_C3_LO_MASK;
+        }
+        else {
+            p1_lo = map1[1] | map1_mask[1];
+        }
+
+        /* P2 output (low + high bank; only the c==3 high word touches the high bank differently). */
+        if (p2_th) {
+            p2_lo = (p2_c == 3) ? (map2[2] | map2_mask[2]) : (map2[0] | map2_mask[0]);
+            p2_hi = (p2_c == 3) ? (map2[5] | map2_mask[5]) : (map2[3] | map2_mask[3]);
+        }
+        else {
+            if (p2_c == 2) {
+                p2_lo = (map2[1] | map2_mask[1]) & SIX_BTNS_P2_C2_LO_MASK;
+            }
+            else if (p2_c == 3) {
+                p2_lo = (map2[1] | map2_mask[1]) | SIX_BTNS_P2_C3_LO_MASK;
+            }
+            else {
+                p2_lo = map2[1] | map2_mask[1];
+            }
+            p2_hi = map2[4] | map2_mask[4];
+        }
+
+        GPIO.out = (GPIO.out & ~(P1_OUT0_MASK | P2_OUT0_MASK))
+                 | (p1_lo & P1_OUT0_MASK) | (p2_lo & P2_OUT0_MASK);
+        GPIO.out1.val = (GPIO.out1.val & ~P2_OUT1_MASK) | (p2_hi & P2_OUT1_MASK);
+
+        /* Turbo bookkeeping runs only AFTER the data lines are driven: its 32-entry loop must not
+         * sit in the edge->output path, or it delays the cycle's output long enough that a fast
+         * reader (240p test / 32X) samples the previous phase - seen as sluggish C/Start on TR. */
+        if (p1_poll) {
+            ++wired_adapter.data[0].frame_cnt;
+            genesis_gen_turbo_mask(0, &wired_adapter.data[0]);
+        }
+        if (p2_poll) {
+            ++wired_adapter.data[1].frame_cnt;
+            genesis_gen_turbo_mask(1, &wired_adapter.data[1]);
+        }
+
+        prev_in = in1;
+    }
+}
+
 static void sega_genesis_task(void) {
     uint32_t timeout, cur_in, prev_in, change, idx = 0, lock = 0;
     uint32_t p1_out0 = GPIO.out | ~P1_OUT0_MASK;
@@ -467,13 +660,35 @@ static void sega_genesis_task(void) {
     while (1) {
         timeout = 0;
         cur_in = prev_in = GPIO.in1.val;
-        while (!(change = cur_in ^ prev_in)) {
+        while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
             prev_in = cur_in;
             cur_in = GPIO.in1.val;
         }
 
         if (change & BIT(P1_TH_PIN - 32)) {
 p1_poll_start:
+            if (dev_type[0] == DEV_GENESIS_3BTNS) {
+                /* Combinational 3-button: drive the word matching the actual TH
+                 * level, with no phase assumption. 6-button / mouse / multitap
+                 * keep the edge-counted path below. */
+                if (lock) {
+                    core0_stall_end();
+                    lock = 0;
+                }
+                if (cur_in & BIT(P1_TH_PIN - 32)) {
+                    GPIO.out = (map1[0] | map1_mask[0]) & p2_out0;                            /* TH high: B/C */
+                    GPIO.out1.val = (map1[3] | map1_mask[3]) & p2_out1;
+                }
+                else {
+                    GPIO.out = (map1[1] | map1_mask[1]) & p2_out0;                            /* TH low: A/Start */
+                    GPIO.out1.val = (map1[4] | map1_mask[4]) & p2_out1;
+                    ++wired_adapter.data[0].frame_cnt;
+                    genesis_gen_turbo_mask(0, &wired_adapter.data[0]);
+                }
+                p1_out0 = GPIO.out | ~P1_OUT0_MASK;
+                p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
+                goto next_poll;
+            }
             if (cur_in & BIT(P1_TH_PIN - 32)) {
                 goto p1_reverse_poll;
             }
@@ -518,7 +733,7 @@ p1_poll_start:
             }
             timeout = 0;
             cur_in = prev_in = GPIO.in1.val;
-            while (!(change = cur_in ^ prev_in)) {
+            while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                 prev_in = cur_in;
                 cur_in = GPIO.in1.val;
                 if (++timeout > POLL_TIMEOUT) {
@@ -539,7 +754,7 @@ p1_reverse_poll:
             p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
             timeout = 0;
             cur_in = prev_in = GPIO.in1.val;
-            while (!(change = cur_in ^ prev_in)) {
+            while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                 prev_in = cur_in;
                 cur_in = GPIO.in1.val;
                 if (++timeout > POLL_TIMEOUT) {
@@ -556,7 +771,7 @@ p1_reverse_poll:
             if (dev_type[0] == DEV_GENESIS_6BTNS) {
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -572,7 +787,7 @@ p1_reverse_poll:
                 p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -588,7 +803,7 @@ p1_reverse_poll:
                 p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -604,7 +819,7 @@ p1_reverse_poll:
                 p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -620,7 +835,7 @@ p1_reverse_poll:
                 p1_out1 = GPIO.out1.val | ~P1_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -638,6 +853,26 @@ p1_reverse_poll:
         }
         else {
 p2_poll_start:
+            if (dev_type[1] == DEV_GENESIS_3BTNS) {
+                /* Combinational 3-button (see P1 above). */
+                if (lock) {
+                    core0_stall_end();
+                    lock = 0;
+                }
+                if (cur_in & BIT(P2_TH_PIN - 32)) {
+                    GPIO.out = p1_out0 & (map2[0] | map2_mask[0]);                            /* TH high: B/C */
+                    GPIO.out1.val = p1_out1 & (map2[3] | map2_mask[3]);
+                }
+                else {
+                    GPIO.out = p1_out0 & (map2[1] | map2_mask[1]);                            /* TH low: A/Start */
+                    GPIO.out1.val = p1_out1 & (map2[4] | map2_mask[4]);
+                    ++wired_adapter.data[1].frame_cnt;
+                    genesis_gen_turbo_mask(1, &wired_adapter.data[1]);
+                }
+                p2_out0 = GPIO.out | ~P2_OUT0_MASK;
+                p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
+                goto next_poll;
+            }
             if (cur_in & BIT(P2_TH_PIN - 32)) {
                 goto p2_reverse_poll;
             }
@@ -682,7 +917,7 @@ p2_poll_start:
             }
             timeout = 0;
             cur_in = prev_in = GPIO.in1.val;
-            while (!(change = cur_in ^ prev_in)) {
+            while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                 prev_in = cur_in;
                 cur_in = GPIO.in1.val;
                 if (++timeout > POLL_TIMEOUT) {
@@ -703,7 +938,7 @@ p2_reverse_poll:
             p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
             timeout = 0;
             cur_in = prev_in = GPIO.in1.val;
-            while (!(change = cur_in ^ prev_in)) {
+            while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                 prev_in = cur_in;
                 cur_in = GPIO.in1.val;
                 if (++timeout > POLL_TIMEOUT) {
@@ -720,7 +955,7 @@ p2_reverse_poll:
             if (dev_type[1] == DEV_GENESIS_6BTNS) {
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -736,7 +971,7 @@ p2_reverse_poll:
                 p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -752,7 +987,7 @@ p2_reverse_poll:
                 p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -768,7 +1003,7 @@ p2_reverse_poll:
                 p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -784,7 +1019,7 @@ p2_reverse_poll:
                 p2_out1 = GPIO.out1.val | ~P2_OUT1_MASK;
                 timeout = 0;
                 cur_in = prev_in = GPIO.in1.val;
-                while (!(change = cur_in ^ prev_in)) {
+                while (!(change = (cur_in ^ prev_in) & GEN_TH_MASK)) {
                     prev_in = cur_in;
                     cur_in = GPIO.in1.val;
                     if (++timeout > POLL_TIMEOUT) {
@@ -914,7 +1149,7 @@ static void ea_genesis_task(void) {
         prev_in1 = cur_in1;
         cur_in0 = GPIO.in;
         cur_in1 = GPIO.in1.val;
-        while (!(change0 = cur_in0 ^ prev_in0) && !(change1 = cur_in1 ^ prev_in1)) {
+        while (!(change0 = cur_in0 ^ prev_in0) && !(change1 = (cur_in1 ^ prev_in1) & EA_SEL_MASK1)) {
             prev_in0 = cur_in0;
             prev_in1 = cur_in1;
             cur_in0 = GPIO.in;
@@ -1171,6 +1406,13 @@ void sega_io_init(uint32_t package) {
     if (wired_adapter.system_id == GENESIS) {
         if (dev_type[0] == DEV_EA_MULTITAP) {
             ea_genesis_task();
+        }
+        else if (dev_type[0] == DEV_GENESIS_3BTNS && dev_type[1] == DEV_GENESIS_3BTNS) {
+            sega_genesis_3btn_task();
+        }
+        else if ((dev_type[0] == DEV_GENESIS_3BTNS || dev_type[0] == DEV_GENESIS_6BTNS)
+              && (dev_type[1] == DEV_GENESIS_3BTNS || dev_type[1] == DEV_GENESIS_6BTNS)) {
+            sega_genesis_pad_task();
         }
         else {
             sega_genesis_task();
